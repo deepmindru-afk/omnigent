@@ -285,6 +285,124 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# warm model switch (session/set_config_option)
+# ---------------------------------------------------------------------------
+
+
+def _model_option(current: str, *values: str) -> dict:
+    """A ``config_option_update`` payload advertising a settable model."""
+    return {
+        "sessionUpdate": "config_option_update",
+        "configOptions": [
+            {
+                "id": "model",
+                "currentValue": current,
+                "options": [{"value": v} for v in values],
+            }
+        ],
+    }
+
+
+def test_config_option_update_records_options_and_active_model() -> None:
+    """
+    The agent's ``currentValue`` is the only trustworthy record of the live model.
+
+    **What breaks if this fails**: we'd re-request a switch already in effect, or
+    trust the model's own self-report — which lies (Devin reported ``FAMILY=SWE``
+    after a confirmed switch to Gemini).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium", "swe-1-7-medium", "gemini-3-1-pro"))
+    assert ex._active_model == "swe-1-7-medium"
+    assert "model" in ex._config_option_ids
+
+
+@pytest.mark.asyncio
+async def test_model_override_switches_warm_via_set_config_option() -> None:
+    """
+    A new model is applied with ``session/set_config_option`` using ``configId``.
+
+    ``configId`` is the parameter name the agent expects; ``optionId`` fails with
+    ``missing field 'configId'``. The session is NOT recreated, so the transcript
+    survives the switch.
+
+    **What breaks if this fails**: ``/model`` silently does nothing mid-session,
+    or the switch drops the conversation by respawning.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "s1", "configId": "model", "value": "gemini-3-1-pro-low"},
+        )
+    ]
+    assert ex._active_model == "gemini-3-1-pro-low"
+
+
+@pytest.mark.asyncio
+async def test_model_override_noops_when_already_active_or_unset() -> None:
+    """No redundant round-trip when the model is unchanged or unspecified."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", None)
+    await ex._apply_model_override("s1", "swe-1-7-medium")
+    ex._rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_override_skipped_when_agent_has_no_model_option() -> None:
+    """
+    An agent advertising options but no ``model`` one is left alone.
+
+    **What breaks if this fails**: every turn sends a doomed request to agents
+    that simply don't support switching (goose, kilocode, …).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {"sessionUpdate": "config_option_update", "configOptions": [{"id": "mode"}]}
+    )
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "some-model")
+    ex._rpc.assert_not_awaited()
+    assert ex._model_switch_supported is False
+
+
+@pytest.mark.asyncio
+async def test_model_override_rejection_latches_off_and_does_not_raise() -> None:
+    """
+    A rejected switch is logged and disabled, never fatal.
+
+    **What breaks if this fails**: an agent that doesn't implement
+    ``session/set_config_option`` fails the whole turn instead of answering on
+    the model it already has.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("m1"))
+    ex._rpc = AsyncMock(return_value={"error": {"code": -32601, "message": "unsupported"}})  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", "m2")
+    assert ex._model_switch_supported is False
+    assert ex._active_model == "m1"  # unchanged
+
+    # Latched off: a later turn must not retry.
+    ex._rpc.reset_mock()
+    await ex._apply_model_override("s1", "m3")
+    ex._rpc.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # interrupt → session/cancel
 # ---------------------------------------------------------------------------
 

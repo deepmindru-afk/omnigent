@@ -119,6 +119,13 @@ _UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
 _UPDATE_USAGE = "usage_update"
+_UPDATE_CONFIG_OPTION = "config_option_update"
+
+# ACP ``session/set_config_option`` — the standard warm-switch method. The
+# option id for the model, and the param name the agent expects (``configId``,
+# not ``optionId``).
+_AGENT_METHOD_SET_CONFIG_OPTION = "session/set_config_option"
+_CONFIG_OPTION_MODEL = "model"
 
 # ACP tool-call lifecycle statuses (the terminal ones close a tool card).
 _TOOL_STATUS_COMPLETED = "completed"
@@ -290,6 +297,14 @@ class AcpExecutor(Executor):
         # operates on a *copied* tree whose path diverges from the agent's cwd.
         self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
         self._os_environment: OSEnvironment | None = None
+
+        # Session config options the agent advertises (``mode``, ``model``, …)
+        # and the live model value, both learned from ``config_option_update``.
+        self._config_option_ids: set[str] = set()
+        self._active_model: str | None = None
+        # Latches off once an agent proves it can't warm-switch, so we don't
+        # retry a failing request on every turn.
+        self._model_switch_supported: bool = True
 
         # Parsed argv; the first token is the binary we resolve / sandbox.
         self._argv: list[str] = shlex.split(config.command)
@@ -1071,14 +1086,92 @@ class AcpExecutor(Executor):
             if isinstance(size, int) and size > 0:
                 self._context_window = size
 
+        elif update_type == _UPDATE_CONFIG_OPTION:
+            self._note_config_options(update.get("configOptions"))
+
         return events
+
+    def _note_config_options(self, options: object) -> None:
+        """Record which session config options the agent exposes, and their values.
+
+        ACP agents advertise settable options (``mode``, ``model``, …) via
+        ``config_option_update``. Tracking the ids tells us whether a warm model
+        switch is possible at all; tracking ``model``'s ``currentValue`` is the
+        only trustworthy record of which model is live — an agent's own
+        self-report is unreliable.
+        """
+        if not isinstance(options, list):
+            return
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            opt_id = opt.get("id")
+            if not isinstance(opt_id, str):
+                continue
+            self._config_option_ids.add(opt_id)
+            if opt_id == _CONFIG_OPTION_MODEL:
+                current = opt.get("currentValue")
+                if isinstance(current, str) and current:
+                    self._active_model = current
+
+    async def _apply_model_override(self, session_id: str, model: str | None) -> None:
+        """Warm-switch the agent's model via ACP ``session/set_config_option``.
+
+        Standard ACP (not a vendor extension), so this works for any agent that
+        exposes a ``model`` session config option. The transcript is preserved —
+        the session is not recreated — so a ``/model`` pick mid-conversation keeps
+        the history the agent has already built up.
+
+        No-ops when the model is unset, already active, or the agent never
+        advertised a ``model`` option. A failed attempt latches the feature off
+        for this process rather than re-requesting on every turn, and never fails
+        the turn: an agent that can't switch should still answer on the model it
+        has.
+
+        :param session_id: The live ACP session to reconfigure.
+        :param model: Requested model id, or ``None`` to leave it alone.
+        """
+        if not model or model == self._active_model or not self._model_switch_supported:
+            return
+        # Before the first ``config_option_update`` we don't know what's settable;
+        # attempting is harmless because a rejection just latches the feature off.
+        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+            self._model_switch_supported = False
+            logger.info(
+                "acp[%s] agent exposes no %r config option; leaving model as-is",
+                self._config.name,
+                _CONFIG_OPTION_MODEL,
+            )
+            return
+
+        response = await self._rpc(
+            _AGENT_METHOD_SET_CONFIG_OPTION,
+            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+        )
+        if "error" in response:
+            self._model_switch_supported = False
+            logger.warning(
+                "acp[%s] model switch to %s rejected (%s); continuing on the current model",
+                self._config.name,
+                model,
+                response["error"].get("message", response["error"]),
+            )
+            return
+        # The agent echoes its options back; trust that over our request so
+        # ``_active_model`` reflects what the agent actually holds.
+        result = response.get("result")
+        if isinstance(result, dict):
+            self._note_config_options(result.get("configOptions"))
+        if self._active_model != model:
+            self._active_model = model
+        logger.info("acp[%s] model switched to %s (transcript kept)", self._config.name, model)
 
     async def run_turn(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-        config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the interface
+        config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn of the agent loop via ACP.
 
@@ -1100,6 +1193,16 @@ class AcpExecutor(Executor):
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return
+
+        # Apply a ``/model`` pick to the live session before prompting, so the
+        # switch takes effect on this turn with the transcript intact. Never fatal
+        # — an agent that can't switch answers on the model it already has.
+        requested_model = config.model if config is not None else None
+        try:
+            await self._apply_model_override(session_id, requested_model)
+        except Exception as exc:  # noqa: BLE001
+            self._model_switch_supported = False
+            logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
 
         # A fresh ACP session holds no prior context. Captured before the latch
         # flips so we know whether to replay history into this turn.
