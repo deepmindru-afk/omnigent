@@ -199,3 +199,45 @@ def test_embedded_agent_forwards_env_passthrough(_isolate_config: Path) -> None:
     )
     env = _build_acp_spawn_env(spec)
     assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"
+
+
+def test_tool_hooks_absent_when_default(_isolate_config: Path) -> None:
+    """With tool_hooks=none (the default), no hook env var is set.
+
+    What breaks if this fails: the harness could accidentally enable hooks
+    for agents that don't opt in, writing config files to the user's cwd.
+    """
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert "HARNESS_ACP_TOOL_HOOKS" not in env
+
+
+def test_tool_hooks_forwarded_when_enabled(_isolate_config: Path) -> None:
+    """When tool_hooks is set, the format name is forwarded to the harness."""
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Devin",
+                "command": "devin acp",
+                "tool_hooks": "claude-code",
+            }
+        ],
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:devin"))
+    assert env["HARNESS_ACP_TOOL_HOOKS"] == "claude-code"
+
+
+def test_embedded_tool_hooks_forwarded(_isolate_config: Path) -> None:
+    """A spec-embedded one-shot agent can set tool_hooks."""
+    _write_acp_config(_isolate_config, agents=[])
+    spec = _make_spec(
+        harness="acp:embedded",
+        acp_agent={
+            "name": "Embedded",
+            "command": "agent stdio",
+            "tool_hooks": "claude-code",
+        },
+    )
+    env = _build_acp_spawn_env(spec)
+    assert env["HARNESS_ACP_TOOL_HOOKS"] == "claude-code"

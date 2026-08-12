@@ -1614,12 +1614,16 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        tool_hooks = embedded.get("tool_hooks", "none")
+        if not isinstance(tool_hooks, str) or tool_hooks not in ("none", "claude-code"):
+            tool_hooks = "none"
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
             command=command.strip(),
             omnigent_mcp=omnigent_mcp,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
+            tool_hooks=tool_hooks,
         )
     else:
         agent = resolve_acp_agent(slug) if slug else None
@@ -1634,6 +1638,8 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if agent.tool_hooks != "none":
+            env["HARNESS_ACP_TOOL_HOOKS"] = agent.tool_hooks
         if agent.env_passthrough:
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
