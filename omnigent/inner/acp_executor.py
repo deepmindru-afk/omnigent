@@ -999,21 +999,32 @@ class AcpExecutor(Executor):
     def _usage_from_result(result: _AcpJsonObject) -> dict[str, int] | None:
         """Map an agent's final ``result.usage`` to Omnigent's usage keys.
 
-        ACP does not standardize usage, but agents that report it (Goose) use
-        ``{totalTokens, inputTokens, outputTokens}``; Omnigent's
-        ``TurnComplete.usage`` uses ``{input_tokens, output_tokens, total_tokens}``.
+        ACP does not standardize usage, but agents that report it (Goose, Devin)
+        use ``{totalTokens, inputTokens, outputTokens}`` plus an optional
+        ``cachedReadTokens``; Omnigent's ``TurnComplete.usage`` uses
+        ``{input_tokens, output_tokens, total_tokens, cache_read_input_tokens}``.
         Absent → ``None`` (usage simply isn't shown for agents that don't report).
+
+        ``cachedReadTokens`` is kept as its own key rather than folded into
+        ``input_tokens``: cache reads are real consumption but billed at a
+        fraction of the rate, so collapsing them would overstate cost — in one
+        measured turn 10,944 of 15,637 input tokens were cache reads.
+        ``cache_read_input_tokens`` is the key the rest of the stack already
+        speaks, so it renders without any UI change.
         """
         usage = result.get("usage")
         if not isinstance(usage, dict):
             return None
         out: dict[str, int] = {}
-        if isinstance(usage.get("inputTokens"), int):
-            out["input_tokens"] = usage["inputTokens"]
-        if isinstance(usage.get("outputTokens"), int):
-            out["output_tokens"] = usage["outputTokens"]
-        if isinstance(usage.get("totalTokens"), int):
-            out["total_tokens"] = usage["totalTokens"]
+        for acp_key, omni_key in (
+            ("inputTokens", "input_tokens"),
+            ("outputTokens", "output_tokens"),
+            ("totalTokens", "total_tokens"),
+            ("cachedReadTokens", "cache_read_input_tokens"),
+        ):
+            value = usage.get(acp_key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                out[omni_key] = value
         return out or None
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:

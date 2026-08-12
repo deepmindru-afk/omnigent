@@ -227,6 +227,46 @@ def test_usage_update_sets_context_window() -> None:
     assert ex.max_context_tokens() == 200000
 
 
+def test_usage_maps_cached_reads_to_the_canonical_key() -> None:
+    """
+    ``cachedReadTokens`` surfaces as its own ``cache_read_input_tokens``.
+
+    Cache reads are real consumption billed at a fraction of the input rate, so
+    folding them into ``input_tokens`` (or dropping them, as before) misreports
+    cost — in a measured Devin turn 10,944 of 15,637 input tokens were cache
+    reads. ``cache_read_input_tokens`` is the key the SSE layer and AgentInfo
+    already render, so no UI change is needed.
+
+    **What breaks if this fails**: a future token budget computes ~3x the real
+    consumption and fires almost immediately.
+    """
+    usage = AcpExecutor._usage_from_result(
+        {
+            "usage": {
+                "totalTokens": 15675,
+                "inputTokens": 15637,
+                "outputTokens": 38,
+                "cachedReadTokens": 10944,
+            }
+        }
+    )
+    assert usage == {
+        "total_tokens": 15675,
+        "input_tokens": 15637,
+        "output_tokens": 38,
+        "cache_read_input_tokens": 10944,
+    }
+
+
+def test_usage_omits_absent_and_non_integer_fields() -> None:
+    """Agents that report a subset (or garbage) still yield usable usage."""
+    assert AcpExecutor._usage_from_result({"usage": {"totalTokens": 10}}) == {"total_tokens": 10}
+    # ``True`` is an int subclass — it must not be mistaken for a token count.
+    assert AcpExecutor._usage_from_result({"usage": {"inputTokens": True}}) is None
+    assert AcpExecutor._usage_from_result({"usage": {"totalTokens": "nope"}}) is None
+    assert AcpExecutor._usage_from_result({}) is None
+
+
 def test_in_progress_tool_update_emits_nothing() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     ex._handle_session_update({"sessionUpdate": "tool_call", "toolCallId": "c3", "title": "t"})
